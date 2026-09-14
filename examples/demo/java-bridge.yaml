@@ -1,0 +1,9 @@
+target: classes
+classpath: []
+java: java
+javac: javac
+javap: javap
+decompiler: cfr
+cfr_jar: ''
+cache_dir: .cache/java-bridge
+timeout_s: 180

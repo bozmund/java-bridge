@@ -1,0 +1,50 @@
+# reagent configuration for the java-bridge demo (run from this directory).
+llm:
+  provider: openai-compat
+  base_url: http://127.0.0.1:8080/v1
+  model: qwen3.8-27b-q5
+  api_key: local
+  max_tokens: 8192
+  temperature: 0.0
+  timeout_s: 1800
+
+backend:
+  type: ghidra-bridge
+  cli_path: java-bridge
+  timeout_s: 180
+
+project_profile:
+  name: java-demo
+  source_root: empty-src
+  source_extensions:
+    - ".java"
+  hooks_csv: null
+  language_standard: Java
+  prompt_rules:
+    - "Use plain Java with no external dependencies"
+
+validation:
+  enabled: true
+  require_build: true
+  trust_configured_commands: true
+  build_commands:
+    - "java-bridge validate {candidate_file}"
+  command_timeout_s: 600
+  working_directory: .
+
+parity:
+  enabled: false
+
+orchestrator:
+  max_review_rounds: 3
+  max_llm_calls_per_function: 24
+  max_attempts_per_function: 2
+  max_investigations: 4
+  selection_strategy: high-impact
+  objective_verifier_enabled: true
+
+output:
+  report_dir: reports/re-agent
+  log_dir: reports/re-agent/logs
+  session_file: re-agent-progress.json
+  format: text

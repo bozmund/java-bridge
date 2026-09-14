@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.cache/
+reports/
+re-agent-progress.json
+examples/demo/classes/
+examples/demo/empty-src/
+.pytest_cache/
