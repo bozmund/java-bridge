@@ -204,7 +204,10 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str, candidate_src: str
             lines.append(f"  {m.modifiers} {ret} {name}({params_src});")
         elif ret == "void" or m.name == "<init>":
             ret_out = ret if m.name != "<init>" else ""
-            lines.append(f"  {m.modifiers} {ret_out}{name}({params_src}) {{ }}".rstrip())
+            lines.append(
+                "  "
+                + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ }}") if p)
+            )
         else:
             lines.append(
                 f"  {m.modifiers} {ret} {name}({params_src}) {{ throw new UnsupportedOperationException(); }}"
