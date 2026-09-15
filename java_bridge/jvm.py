@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 PRIMITIVE_TYPES: dict[str, str] = {
     "B": "byte",
     "C": "char",
@@ -61,11 +63,14 @@ def parse_descriptor(desc: str) -> tuple[list[str], str]:
 def java_type_key(type_name: str) -> str:
     """Normalize a Java type name for comparison against descriptor types.
 
-    Keeps the last dot segment plus the array brackets:
+    Keeps the last segment (split on ``.`` and ``$`` — descriptors write
+    inner classes as ``Climate$Sampler`` while source writes
+    ``Climate.Sampler``) plus the array brackets:
     ``java.lang.String`` -> ``String``, ``int[][]`` -> ``int[][]``,
-    ``List<String>`` (generics stripped) -> ``List``.
+    ``List<String>`` (generics stripped) -> ``List``,
+    ``net.minecraft.Climate$Sampler`` -> ``Sampler``.
     """
     t = type_name.strip()
     if "<" in t:  # drop generic parameters
         t = t[: t.index("<")]
-    return t.rsplit(".", 1)[-1]
+    return re.split(r"[.$]", t)[-1]
