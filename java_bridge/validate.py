@@ -187,7 +187,26 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str, candidate_src: str
     for f in cls.fields:
         if cls.is_enum and f.type == cls_name:
             continue  # enum constants need bodies
-        lines.append(f"  {f.modifiers} {f.type} {f.name};")
+        # generics in the signature attribute keep descriptor-style '$' for
+        # inner classes; Java source needs the dot form. `final` is dropped:
+        # the stub has no initializers (the real class assigns in <clinit>).
+        fmods = " ".join(m for m in f.modifiers.split() if m != "final")
+        lines.append(f"  {fmods} {f.type.replace('$', '.')} {f.name};")
+    # The stub shadows the real class file, so nested classes it references
+    # must be declared. Empty placeholders are enough for signature
+    # type-checking (stub bodies never run).
+    for other_name in sorted(idx.classes):
+        if other_name.startswith(cls_name + "$"):
+            other = idx.classes[other_name]
+            simple = other_name.rsplit("$", 1)[-1]
+            if simple.isdigit():
+                continue  # anonymous class; not a usable type name
+            if other.kind == "interface":
+                lines.append(f"  static interface {simple} {{}}")
+            elif other.is_enum:
+                lines.append(f"  static enum {simple} {{ PLACEHOLDER }}")
+            else:
+                lines.append(f"  static class {simple} {{}}")
     for m in cls.methods:
         if m.name == "<clinit>":
             continue
@@ -198,6 +217,10 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str, candidate_src: str
             params, ret = parse_descriptor(m.descriptor)
         except ValueError:
             params, ret = [], "void"
+        # Descriptor internal names use '$' for inner classes; Java source
+        # requires the dot form (Climate$Sampler -> Climate.Sampler).
+        params = [t.replace("$", ".") for t in params]
+        ret = ret.replace("$", ".")
         params_src = ", ".join(f"{t} p{i}" for i, t in enumerate(params))
         name = cls_name.rsplit(".", 1)[-1] if m.name == "<init>" else m.name
         if "abstract" in m.modifiers or (cls.is_interface and "default" not in m.modifiers):
