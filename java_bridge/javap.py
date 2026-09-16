@@ -212,8 +212,9 @@ def parse_javap(text: str) -> ClassInfo | None:
                 cur = MethodInfo(class_name, "<clinit>", "()V", "static")
                 info.methods.append(cur)
                 field_pending = None
-            elif stripped.endswith(");") and "(" in stripped:
-                cur = _parse_method_header(class_name, stripped)
+            elif "(" in stripped and re.search(r"\)\s*(?:throws [\w$.,\s]+)?;$", stripped):
+                # method header; may end with ') throws ...;'
+                cur = _parse_method_header(class_name, re.sub(r"\s*throws [\w$.,\s]+;$", ");", stripped))
                 info.methods.append(cur)
                 field_pending = None
             elif stripped.endswith(";") and not stripped.endswith("());"):
