@@ -294,6 +294,39 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
     return sorted(f"import {fqn};" for fqn in imports.values())
 
 
+def _bridge_method_descriptors(cls: object) -> set[str]:
+    """Descriptors that look like synthetic bridges: same name as another
+    method of the class whose parameter types match after replacing class
+    types by Object (the javap -p output lacks the ACC_BRIDGE flag)."""
+    by_name: dict[str, list[str]] = {}
+    for m in cls.methods:
+        if m.name in ("<clinit>", "<init>"):
+            continue
+        try:
+            params, _ = parse_descriptor(m.descriptor)
+        except ValueError:
+            params = []
+        by_name.setdefault(m.name, []).append(tuple(
+            p.replace("$", ".") for p in params))
+    out: set[str] = set()
+    for name, groups in by_name.items():
+        if len(groups) < 2:
+            continue
+        for i, a in enumerate(groups):
+            for j, b in enumerate(groups):
+                if i == j:
+                    continue
+                if len(a) != len(b):
+                    continue
+                if all(x == y or (x == "java.lang.Object" and y != "java.lang.Object")
+                       for x, y in zip(a, b)):
+                    out.add(next(m.descriptor for m in cls.methods
+                                 if m.name == name
+                                 and tuple(p.replace("$", ".") for p in parse_descriptor(m.descriptor)[0]) == a))
+                    break
+    return out
+
+
 def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
                   candidate_src: str, classpath: str,
                   super_args: list[str] | None = None) -> str:
@@ -367,6 +400,7 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
                 body.append(f"  static enum {simple} {{ PLACEHOLDER }}")
             else:
                 body.append(f"  static class {simple} {{}}")
+    bridges = _bridge_method_descriptors(cls)
     for m in cls.methods:
         if m.name == "<clinit>":
             continue
@@ -374,6 +408,10 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
                    and (skip_desc is None or m.descriptor == skip_desc))
         if is_skip:
             body.append("  " + candidate_src.strip() + "")
+            continue
+        if m.descriptor in bridges:
+            # synthetic bridge (same name, Object-widened params): the real
+            # class carries ACC_BRIDGE, a stub method cannot
             continue
         try:
             params, ret = parse_descriptor(m.descriptor)
