@@ -467,11 +467,33 @@ def _stub_body_lines(idx: Index, cls_name: str,
         inner = simple.rsplit("$", 1)[-1]
         simple = inner if not inner.isdigit() else f"__Anon{inner}"
     decl = f"{kind} {simple}"
+    comp_names: list[str] = []
     if is_record:
-        # record header takes the components (the record's fields, in
-        # declaration order); components are final fields and cannot be
-        # re-declared in the body.
-        comps = ", ".join(f"{f.type.replace('$', '.')} {f.name}" for f in cls.fields)
+        # Components are the canonical constructor's parameters, named
+        # after the implicit accessor methods (accessors are the only
+        # surviving component names in bytecode). Fields are NOT
+        # components (records may have plain static fields too).
+        def _nparams(d: str) -> int:
+            try:
+                return len(parse_descriptor(d)[0])
+            except ValueError:
+                return -1
+        object_methods = {"toString", "hashCode", "equals", "wait",
+                          "notify", "notifyAll", "getClass"}
+        comp_names = [m.name for m in cls.methods
+                      if m.name not in object_methods
+                      and m.name != "<init>" and _nparams(m.descriptor) == 0
+                      and not any(mod in m.modifiers.split()
+                                   for mod in ("static", "abstract"))]
+        canonical = [m for m in cls.methods
+                     if m.name == "<init>" and _nparams(m.descriptor) == len(comp_names)]
+        if len(canonical) == 1 and _nparams(canonical[0].descriptor) > 0:
+            comp_types = [p.replace("$", ".")
+                          for p in parse_descriptor(canonical[0].descriptor)[0]]
+            comps = ", ".join(f"{comp_types[i]} {comp_names[i]}"
+                              for i in range(len(comp_names)))
+        else:
+            comps = ", ".join(f"java.lang.Object {c}" for c in comp_names)
         decl += f"({comps})"
     elif cls.extends and cls.kind != "interface":
         decl += f" extends {cls.extends}"
@@ -479,8 +501,9 @@ def _stub_body_lines(idx: Index, cls_name: str,
         decl += f" implements {impl.group(1).strip()}"
     body: list[str] = []
     body.append(decl + " {")
+    accessor_names = set(comp_names) if is_record else set()
     for f in cls.fields:
-        if is_record:
+        if is_record and f.name in accessor_names:
             continue  # components already in the header
         if cls.is_enum and f.type == cls_name:
             continue  # enum constants need bodies
@@ -514,6 +537,20 @@ def _stub_body_lines(idx: Index, cls_name: str,
             else:
                 body.append(f"  static class {other_simple} {{}}")
     bridges = _bridge_method_descriptors(cls)
+    record_accessors = set()
+    if is_record:
+        # implicit accessors: a zero-arg, non-static method whose name
+        # matches a component is declared by the record header itself
+        for c in comp_names:
+            for m in cls.methods:
+                if m.name != c or "static" in m.modifiers.split():
+                    continue
+                try:
+                    if parse_descriptor(m.descriptor)[0]:
+                        continue
+                except ValueError:
+                    continue
+                record_accessors.add(m.descriptor)
     for m in cls.methods:
         if m.name == "<clinit>":
             continue
@@ -526,6 +563,8 @@ def _stub_body_lines(idx: Index, cls_name: str,
             # synthetic bridge (same name, Object-widened params): the real
             # class carries ACC_BRIDGE, a stub method cannot
             continue
+        if m.descriptor in record_accessors:
+            continue  # record header declares it implicitly
         try:
             params, ret = parse_descriptor(m.descriptor)
         except ValueError:
@@ -534,7 +573,12 @@ def _stub_body_lines(idx: Index, cls_name: str,
         # requires the dot form (Climate$Sampler -> Climate.Sampler).
         params = [t.replace("$", ".") for t in params]
         ret = ret.replace("$", ".")
-        params_src = ", ".join(f"{t} p{i}" for i, t in enumerate(params))
+        if (m.name == "<init>" and is_record
+                and len(params) == len(comp_names)):
+            params_src = ", ".join(f"{params[i]} {comp_names[i]}"
+                                   for i in range(len(params)))
+        else:
+            params_src = ", ".join(f"{t} p{i}" for i, t in enumerate(params))
         name = simple if m.name == "<init>" else m.name
         # ctors never take visibility modifiers in source
         mods = " ".join(mm for mm in m.modifiers.split()
@@ -545,6 +589,13 @@ def _stub_body_lines(idx: Index, cls_name: str,
             body.append(f"  {m.modifiers} {ret} {name}({params_src});")
         elif ret == "void" or m.name == "<init>":
             ret_out = ret if m.name != "<init>" else ""
+            if m.name == "<init>" and is_record and len(params) == len(comp_names):
+                # record components are implicitly final: the canonical
+                # ctor must assign every component
+                assigns = " ".join(f"this.{comp_names[i]} = {comp_names[i]};"
+                                   for i in range(len(comp_names)))
+                body.append(f"  {mods} {name}({params_src}) {{ {assigns} }}")
+                continue
             if m.name == "<init>" and my_super_args is not None:
                 call = "super(" + ", ".join(my_super_args) + ");"
                 body.append(
