@@ -372,7 +372,7 @@ def _bridge_method_descriptors(cls: object) -> set[str]:
         lines = m.lines
         if len(lines) > 30:
             continue
-        if not re.match(r"^(i|l|f|d|a)?return$", lines[-1].opcode):
+        if lines[-1].opcode != "areturn" and not re.match(r"^(i|l|f|d)return$", lines[-1].opcode):
             continue
         invokes = [l for l in lines if l.opcode.startswith("invoke")]
         if len(invokes) != 1:
@@ -382,7 +382,7 @@ def _bridge_method_descriptors(cls: object) -> set[str]:
             continue
         ok = True
         for l in lines:
-            if l is inv:
+            if l is inv or l is lines[-1]:
                 continue
             if l.opcode == "checkcast":
                 continue
