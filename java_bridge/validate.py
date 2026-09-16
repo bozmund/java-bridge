@@ -329,7 +329,34 @@ def _bridge_method_descriptors(cls: object) -> set[str]:
 
 def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
                   candidate_src: str, classpath: str,
-                  super_args: list[str] | None = None) -> str:
+                  super_args: list[str] | None = None,
+                  nested_target: str | None = None) -> str:
+    """Full stub compilation unit for a candidate.
+
+    nested_target: the target class is a nested class (cls_name is the
+    OUTER); its stub is inlined as a real nested class so that private
+    access between outer and inner is checked as in the source tree.
+    """
+    body = _stub_body_lines(idx, cls_name, skip_method, candidate_src,
+                            classpath, super_args, nested_target)
+    imports = _stub_imports(idx, cls_name, "\n".join(body), classpath)
+    pkg = cls_name.rsplit(".", 1)[0] if "." in cls_name else ""
+    lines: list[str] = []
+    if pkg:
+        lines.append(f"package {pkg};")
+        lines.append("")
+    lines += imports
+    if imports:
+        lines.append("")
+    lines += body
+    return "\n".join(lines) + "\n"
+
+
+def _stub_body_lines(idx: Index, cls_name: str,
+                     skip_method: str | tuple[str, str],
+                     candidate_src: str, classpath: str,
+                     super_args: list[str] | None = None,
+                     nested_target: str | None = None) -> list[str]:
     # super_args: when the real (stubbed) constructors must call a
     # superclass ctor that has no no-arg overload, the args to use
     # (None = emit plain '{}' bodies, the common case)
@@ -362,7 +389,11 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
     is_record = cls.extends in ("java.lang.Record", "Record")
     kind = "record" if is_record else (
         cls.kind if cls.kind in ("class", "interface", "record") else "class")
-    decl = f"{kind} {cls_name.rsplit('.', 1)[-1]}"
+    simple = cls_name.rsplit(".", 1)[-1]
+    if "$" in simple:
+        inner = simple.rsplit("$", 1)[-1]
+        simple = inner if not inner.isdigit() else f"__Anon{inner}"
+    decl = f"{kind} {simple}"
     if is_record:
         # record header takes the components (the record's fields, in
         # declaration order); components are final fields and cannot be
@@ -443,18 +474,7 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
                 f"  {m.modifiers} {ret} {name}({params_src}) {{ throw new UnsupportedOperationException(); }}"
             )
     body.append("}")
-    # Imports are resolved from the FULL stub text (field types and method
-    # signatures need them too, not just the candidate body).
-    imports = _stub_imports(idx, cls_name, "\n".join(body), classpath)
-    lines: list[str] = []
-    if pkg:
-        lines.append(f"package {pkg};")
-        lines.append("")
-    lines += imports
-    if imports:
-        lines.append("")
-    lines += body
-    return "\n".join(lines) + "\n"
+    return body
 
 
 _PRIMITIVE_DEFAULTS = {
@@ -528,17 +548,19 @@ def _parent_ctor_defaults(extends: str, classpath: str) -> list[str] | None:
     return out
 
 
-def _javac(cfg: BridgeConfig, source: str, class_name: str, workdir: Path) -> tuple[bool, str, Path | None]:
-    pkg = class_name.rsplit(".", 1)[0]
+def _javac(cfg: BridgeConfig, source: str, class_name: str, workdir: Path,
+           outer_class: str | None = None) -> tuple[bool, str, Path | None]:
+    unit = outer_class or class_name  # compilation unit = outer class
+    pkg = unit.rsplit(".", 1)[0]
     src_dir = workdir / "src"
     dst_dir = workdir / "out"
     src_dir.mkdir(parents=True, exist_ok=True)
     dst_dir.mkdir(parents=True, exist_ok=True)
     if pkg:
         (src_dir / pkg).mkdir(parents=True, exist_ok=True)
-        src_file = src_dir / pkg / f"{class_name.rsplit('.', 1)[-1]}.java"
+        src_file = src_dir / pkg / f"{unit.rsplit('.', 1)[-1]}.java"
     else:
-        src_file = src_dir / f"{class_name.rsplit('.', 1)[-1]}.java"
+        src_file = src_dir / f"{unit.rsplit('.', 1)[-1]}.java"
     src_file.write_text(source, encoding="utf-8")
     cp = cfg.classpath_arg()
     cmd = [cfg.javac, "-d", str(dst_dir)]
@@ -547,6 +569,7 @@ def _javac(cfg: BridgeConfig, source: str, class_name: str, workdir: Path) -> tu
     cmd.append(str(src_file))
     proc = subprocess.run(cmd, capture_output=True, text=True,
                           timeout=cfg.timeout_s, check=False)
+    # nested classes compile to Outer$Inner.class in the outer's package dir
     compiled = dst_dir / (class_name.replace(".", "/") + ".class")
     return proc.returncode == 0, (proc.stdout + proc.stderr).strip(), (compiled if compiled.is_file() else None)
 
@@ -603,9 +626,17 @@ def validate(cfg: BridgeConfig, idx: Index, candidate_file: Path,
         primary_err = str(exc)
         # Fallback: stub class from javap metadata.
         try:
-            stub = _stub_source(idx, m.class_name, (m.name, m.descriptor),
-                                candidate_src, cfg.classpath_arg())
-            ok, output, compiled_path = _javac(cfg, stub, m.class_name, workdir)
+            if "$" in m.class_name:
+                outer_name = m.class_name.rsplit("$", 1)[0]
+                stub = _stub_source(idx, outer_name, (m.name, m.descriptor),
+                                    candidate_src, cfg.classpath_arg(),
+                                    nested_target=m.class_name)
+                ok, output, compiled_path = _javac(
+                    cfg, stub, m.class_name, workdir, outer_class=outer_name)
+            else:
+                stub = _stub_source(idx, m.class_name, (m.name, m.descriptor),
+                                    candidate_src, cfg.classpath_arg())
+                ok, output, compiled_path = _javac(cfg, stub, m.class_name, workdir)
             detail = output
             if not ok and ("cannot be applied" in output
                            or "cannot find symbol" in output
