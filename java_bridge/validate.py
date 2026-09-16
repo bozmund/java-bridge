@@ -423,7 +423,7 @@ def _stub_body_lines(idx: Index, cls_name: str,
         if other_name.startswith(cls_name + "$"):
             other = idx.classes[other_name]
             simple = other_name.rsplit("$", 1)[-1]
-            if simple.isdigit():
+            if simple.isdigit() or re.match(r"^\d", simple):
                 continue  # anonymous class; not a usable type name
             if other.kind == "interface":
                 body.append(f"  static interface {simple} {{}}")
