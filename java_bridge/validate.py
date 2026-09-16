@@ -498,7 +498,7 @@ def _stub_body_lines(idx: Index, cls_name: str,
     elif cls.extends and cls.kind != "interface":
         decl += f" extends {cls.extends}"
     if impl:
-        decl += f" implements {impl.group(1).strip()}"
+        decl += " implements " + impl.group(1).strip().replace("$", ".")
     body: list[str] = []
     body.append(decl + " {")
     accessor_names = set(comp_names) if is_record else set()
@@ -530,12 +530,35 @@ def _stub_body_lines(idx: Index, cls_name: str,
                 continue
             if other_simple.isdigit() or re.match(r"^\d", other_simple):
                 continue  # anonymous class; not a usable type name
-            if other.kind == "interface":
-                body.append(f"  static interface {other_simple} {{}}")
-            elif other.is_enum:
-                body.append(f"  static enum {other_simple} {{ PLACEHOLDER }}")
-            else:
-                body.append(f"  static class {other_simple} {{}}")
+            # Full stub: candidates may call nested ctors/methods.
+            inner_lines = _stub_body_lines(
+                idx, other_name, None, "", classpath, None,
+                nested_target=None)
+            # A genuine inner class (non-static) ctor takes the enclosing
+            # instance as first param; all others are static nested.
+            takes_outer = False
+            for om in other.methods:
+                if om.name != "<init>":
+                    continue
+                try:
+                    op = parse_descriptor(om.descriptor)[0]
+                except ValueError:
+                    op = []
+                if op and op[0].replace("$", ".") == cls_name:
+                    takes_outer = True
+            if not takes_outer:
+                first = inner_lines[0]
+                kw = first.lstrip().split(" ", 1)[0]
+                if kw in ("class", "interface", "enum", "record"):
+                    inner_lines[0] = first.replace(kw, f"static {kw}", 1)
+            body.extend("  " + ln for ln in inner_lines)
+    # final instance fields must be assigned in every ctor stub
+    final_assigns = " ".join(
+        f"{f.name} = {_default_for_source_type(f.type.replace('$', '.'))};"
+        for f in cls.fields
+        if "final" in f.modifiers.split()
+        and "static" not in f.modifiers.split()
+        and f.name not in accessor_names)
     bridges = _bridge_method_descriptors(cls)
     record_accessors = set()
     if is_record:
@@ -596,17 +619,16 @@ def _stub_body_lines(idx: Index, cls_name: str,
                                    for i in range(len(comp_names)))
                 body.append(f"  {mods} {name}({params_src}) {{ {assigns} }}")
                 continue
-            if m.name == "<init>" and my_super_args is not None:
-                call = "super(" + ", ".join(my_super_args) + ");"
-                body.append(
-                    "  "
-                    + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ {call} }}") if p)
-                )
-            else:
-                body.append(
-                    "  "
-                    + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ }}") if p)
-                )
+            ctor_parts = []
+            if my_super_args is not None:
+                ctor_parts.append("super(" + ", ".join(my_super_args) + ");")
+            if final_assigns:
+                ctor_parts.append(final_assigns)
+            ctor_body = " ".join(ctor_parts)
+            body.append(
+                "  "
+                + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ {ctor_body} }}") if p)
+            )
         else:
             body.append(
                 f"  {m.modifiers} {ret} {name}({params_src}) {{ throw new UnsupportedOperationException(); }}"
