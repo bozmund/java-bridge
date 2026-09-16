@@ -234,8 +234,17 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
                 r"//\s+(?:Method|InterfaceMethod|Field|InvokeDynamic)\s+([\w/$]+)",
                 raw) + re.findall(r"//\s+class\s+([\w/$]+)", raw):
             fqn = tok.split(".", 1)[0].split("(", 1)[0].replace("/", ".")
+            # same-class references print without the class name
+            # ('// Field OFF:L...;') — a bare identifier is a member name,
+            # not an FQN. Bare class refs ('// class X') are same-package
+            # and need no import either, so skip all bare tokens.
+            if "/" not in tok and "." not in tok:
+                continue
             own_fqns.setdefault(fqn.rsplit(".", 1)[-1], set()).add(fqn)
-        for fqn in _FQN_RE.findall(raw):
+        # dot-form scan on the de-commented raw: inside '//' comments the
+        # 'Class.FIELD' suffix of a slash path would match as a fake FQN
+        # (BlockTags.LEAVES) and poison the pool.
+        for fqn in _FQN_RE.findall(re.sub(r"//.*$", "", raw, flags=re.M)):
             own_fqns.setdefault(fqn.rsplit(".", 1)[-1], set()).add(fqn)
     mod_fqns: dict[str, set[str]] = {}
     for c in idx.classes:
@@ -266,6 +275,12 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
         # Priority: the class's own dependencies (its bytecode) — the
         # classpath alone is ambiguous (e.g. six `Path` classes).
         own_c = {c for c in own_fqns.get(name, set()) if usable(c)}
+        # ALL_CAPS identifiers without underscores (OFF, ON, MAX) are
+        # constants; only keep them as types when the class's own
+        # bytecode references exactly one type of that name (UUID).
+        if (name == name.upper() and len(name) > 1 and "_" not in name
+                and len(own_c) != 1):
+            continue
         if own_c:
             chosen = pick(own_c)
             if chosen:
