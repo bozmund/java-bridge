@@ -185,6 +185,16 @@ examples/demo/          3-class demo + ready-made reagent.yaml
 tests/                  34 tests incl. round-trips through reagent's own parsers
 ```
 
+## Credits
+
+java-bridge is an independent project; it exists to give
+[Dryxio/reagent](https://github.com/Dryxio/reagent) a Java target. The
+Ghidra-bridge CLI protocol, the reverser → checker workflow, and the
+objective/verification machinery are reagent's (MIT) — java-bridge
+implements the backend half of that protocol for `.class`/`.jar` inputs and
+reuses no reagent source (the `reagent-java` launcher only swaps prompts).
+It delegates decompilation to CFR (BSD-3) and the JDK's `javap`/`javac`.
+
 ## License
 
 MIT. Delegates to CFR (BSD-3) and the JDK's `javap`/`javac`.
