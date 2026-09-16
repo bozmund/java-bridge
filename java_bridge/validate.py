@@ -31,7 +31,7 @@ CANDIDATE_METHOD_RE = re.compile(
     r"^[ \t]*"
     r"((?:(?:public|protected|private|static|final|synchronized|abstract|default|native|strictfp)[ \t]+)*)"
     r"((?:@[^\n]*\n[ \t]*)*)"
-    r"((?:[\w$]+(?:\s*<[^;{]*>)?(?:\s*\[\s*\])*\s+)?)"
+    r"((?:[\w$.]+(?:\s*<[^;{]*>)?(?:\s*\[\s*\])*\s+)?)"
     r"([\w$]+)[ \t]*\(([^)]*)\)[ \t]*(?:throws [^{;]+)?\{",
     re.M,
 )
