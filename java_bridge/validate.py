@@ -619,16 +619,22 @@ def _stub_body_lines(idx: Index, cls_name: str,
                                    for i in range(len(comp_names)))
                 body.append(f"  {mods} {name}({params_src}) {{ {assigns} }}")
                 continue
-            ctor_parts = []
-            if my_super_args is not None:
-                ctor_parts.append("super(" + ", ".join(my_super_args) + ");")
-            if final_assigns:
-                ctor_parts.append(final_assigns)
-            ctor_body = " ".join(ctor_parts)
-            body.append(
-                "  "
-                + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ {ctor_body} }}") if p)
-            )
+            if m.name == "<init>":
+                ctor_parts = []
+                if my_super_args is not None:
+                    ctor_parts.append("super(" + ", ".join(my_super_args) + ");")
+                if final_assigns:
+                    ctor_parts.append(final_assigns)
+                ctor_body = " ".join(ctor_parts)
+                body.append(
+                    "  "
+                    + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ {ctor_body} }}") if p)
+                )
+            else:
+                body.append(
+                    "  "
+                    + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ }}") if p)
+                )
         else:
             body.append(
                 f"  {m.modifiers} {ret} {name}({params_src}) {{ throw new UnsupportedOperationException(); }}"
