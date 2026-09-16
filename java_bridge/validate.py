@@ -453,7 +453,7 @@ def _stub_body_lines(idx: Index, cls_name: str,
         params = [t.replace("$", ".") for t in params]
         ret = ret.replace("$", ".")
         params_src = ", ".join(f"{t} p{i}" for i, t in enumerate(params))
-        name = cls_name.rsplit(".", 1)[-1] if m.name == "<init>" else m.name
+        name = simple if m.name == "<init>" else m.name
         if "abstract" in m.modifiers or (cls.is_interface and "default" not in m.modifiers):
             body.append(f"  {m.modifiers} {ret} {name}({params_src});")
         elif ret == "void" or m.name == "<init>":
