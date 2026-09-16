@@ -212,16 +212,30 @@ def _classpath_simple_names(classpath: str) -> dict[str, set[str]]:
 
 def _stub_imports(idx: Index, cls_name: str, source_text: str,
                   classpath: str) -> list[str]:
-    """import lines for the simple names the candidate references.
+    """import lines for the simple names the stub references.
 
-    Resolution priority: the target class's own javap text (its real
-    dependencies), then the mod index, then the full classpath. Names in
-    java.lang or the stub's own package never need imports.
+    Resolution priority: the target class's own bytecode references
+    (its real dependencies), then the mod index, then the full
+    classpath. Within a pool, JDK (java.*/javax.*) types beat
+    third-party look-alikes (javaslang/IntelliJ libraries on the MC
+    classpath shadow java.util names; JDK types are also not on the
+    explicit classpath at all, so without this rule they are invisible).
+    Names in java.lang or the stub's own package never need imports.
     """
     own_fqns: dict[str, set[str]] = {}
     cls = idx.classes.get(cls_name)
     if cls is not None:
-        for fqn in _FQN_RE.findall(cls.raw or ""):
+        raw = cls.raw or ""
+        # javap comments use internal (slash) names:
+        #   // Method java/util/Arrays.fill:([II)V
+        #   // Field dev/streamsreflowing/X.y:I
+        #   // class dev/streamsreflowing/core/Climate$Sampler
+        for tok in re.findall(
+                r"//\s+(?:Method|InterfaceMethod|Field|InvokeDynamic)\s+([\w/$]+)",
+                raw) + re.findall(r"//\s+class\s+([\w/$]+)", raw):
+            fqn = tok.split(".", 1)[0].split("(", 1)[0].replace("/", ".")
+            own_fqns.setdefault(fqn.rsplit(".", 1)[-1], set()).add(fqn)
+        for fqn in _FQN_RE.findall(raw):
             own_fqns.setdefault(fqn.rsplit(".", 1)[-1], set()).add(fqn)
     mod_fqns: dict[str, set[str]] = {}
     for c in idx.classes:
@@ -233,24 +247,45 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
         return (not c.startswith("java.lang.") and c != cls_name
                 and c.rsplit(".", 1)[0] != own_pkg and "$" not in c)
 
+    def pick(pool: set[str]) -> str | None:
+        jdk = {c for c in pool if c.startswith(("java.", "javax."))}
+        if len(jdk) == 1:
+            return next(iter(jdk))
+        if len(pool) == 1:
+            return next(iter(pool))
+        return None
+
     imports: dict[str, str] = {}
     for name in _SIMPLE_TYPE_RE.findall(source_text):
-        # Priority: the class's own dependencies (its javap text) — the
+        # Single uppercase letters and CONSTANT_STYLE names are this
+        # codebase's variable/constant fields, not type names.
+        if len(name) == 1 or ("_" in name and name == name.upper()):
+            continue
+        # Priority: the class's own dependencies (its bytecode) — the
         # classpath alone is ambiguous (e.g. six `Path` classes).
         own_c = {c for c in own_fqns.get(name, set()) if usable(c)}
         if own_c:
-            if len(own_c) == 1:
-                imports[name] = next(iter(own_c))
+            chosen = pick(own_c)
+            if chosen:
+                imports[name] = chosen
             continue
         cands = {c for c in (mod_fqns.get(name, set()) | cp.get(name, set()))
                  if usable(c)}
-        if len(cands) == 1:
-            imports[name] = next(iter(cands))
+        chosen = pick(cands)
+        if chosen:
+            imports[name] = chosen
     return sorted(f"import {fqn};" for fqn in imports.values())
 
 
-def _stub_source(idx: Index, cls_name: str, skip_method: str,
+def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
                   candidate_src: str, classpath: str) -> str:
+    # skip may be (name, descriptor): plain-name skip would replace EVERY
+    # overload of the same name (e.g. all <init>s of a class with two
+    # constructors), inserting the candidate multiple times.
+    if isinstance(skip_method, tuple):
+        skip_name, skip_desc = skip_method
+    else:
+        skip_name, skip_desc = skip_method, None
     cls = idx.classes[cls_name]
     if cls.is_enum:
         raise RuntimeError("stub-class fallback is not supported for enums")
@@ -263,22 +298,14 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str,
     impl = re.search(r"\bimplements\b(.+)$", header)
     lines = []
     pkg = cls_name.rsplit(".", 1)[0] if "." in cls_name else ""
-    if pkg:
-        lines.append(f"package {pkg};")
-        lines.append("")
-    # The candidate references types by simple name (like the original
-    # source); the stub has no original import block, so resolve the simple
-    # names against the class's real dependencies and the classpath.
-    lines += _stub_imports(idx, cls_name, candidate_src, classpath)
-    if lines and lines[-1] != "":
-        lines.append("")
     kind = cls.kind if cls.kind in ("class", "interface", "record") else "class"
     decl = f"{kind} {cls_name.rsplit('.', 1)[-1]}"
     if cls.extends and cls.kind != "interface":
         decl += f" extends {cls.extends}"
     if impl:
         decl += f" implements {impl.group(1).strip()}"
-    lines.append(decl + " {")
+    body: list[str] = []
+    body.append(decl + " {")
     for f in cls.fields:
         if cls.is_enum and f.type == cls_name:
             continue  # enum constants need bodies
@@ -286,7 +313,7 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str,
         # inner classes; Java source needs the dot form. `final` is dropped:
         # the stub has no initializers (the real class assigns in <clinit>).
         fmods = " ".join(m for m in f.modifiers.split() if m != "final")
-        lines.append(f"  {fmods} {f.type.replace('$', '.')} {f.name};")
+        body.append(f"  {fmods} {f.type.replace('$', '.')} {f.name};")
     # The stub shadows the real class file, so nested classes it references
     # must be declared. Empty placeholders are enough for signature
     # type-checking (stub bodies never run).
@@ -297,16 +324,18 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str,
             if simple.isdigit():
                 continue  # anonymous class; not a usable type name
             if other.kind == "interface":
-                lines.append(f"  static interface {simple} {{}}")
+                body.append(f"  static interface {simple} {{}}")
             elif other.is_enum:
-                lines.append(f"  static enum {simple} {{ PLACEHOLDER }}")
+                body.append(f"  static enum {simple} {{ PLACEHOLDER }}")
             else:
-                lines.append(f"  static class {simple} {{}}")
+                body.append(f"  static class {simple} {{}}")
     for m in cls.methods:
         if m.name == "<clinit>":
             continue
-        if m.name == skip_method:
-            lines.append("  " + candidate_src.strip() + "")
+        is_skip = (m.name == skip_name
+                   and (skip_desc is None or m.descriptor == skip_desc))
+        if is_skip:
+            body.append("  " + candidate_src.strip() + "")
             continue
         try:
             params, ret = parse_descriptor(m.descriptor)
@@ -319,18 +348,29 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str,
         params_src = ", ".join(f"{t} p{i}" for i, t in enumerate(params))
         name = cls_name.rsplit(".", 1)[-1] if m.name == "<init>" else m.name
         if "abstract" in m.modifiers or (cls.is_interface and "default" not in m.modifiers):
-            lines.append(f"  {m.modifiers} {ret} {name}({params_src});")
+            body.append(f"  {m.modifiers} {ret} {name}({params_src});")
         elif ret == "void" or m.name == "<init>":
             ret_out = ret if m.name != "<init>" else ""
-            lines.append(
+            body.append(
                 "  "
                 + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ }}") if p)
             )
         else:
-            lines.append(
+            body.append(
                 f"  {m.modifiers} {ret} {name}({params_src}) {{ throw new UnsupportedOperationException(); }}"
             )
-    lines.append("}")
+    body.append("}")
+    # Imports are resolved from the FULL stub text (field types and method
+    # signatures need them too, not just the candidate body).
+    imports = _stub_imports(idx, cls_name, "\n".join(body), classpath)
+    lines: list[str] = []
+    if pkg:
+        lines.append(f"package {pkg};")
+        lines.append("")
+    lines += imports
+    if imports:
+        lines.append("")
+    lines += body
     return "\n".join(lines) + "\n"
 
 
@@ -409,7 +449,8 @@ def validate(cfg: BridgeConfig, idx: Index, candidate_file: Path,
         primary_err = str(exc)
         # Fallback: stub class from javap metadata.
         try:
-            stub = _stub_source(idx, m.class_name, m.name, candidate_src, cfg.classpath_arg())
+            stub = _stub_source(idx, m.class_name, (m.name, m.descriptor),
+                                candidate_src, cfg.classpath_arg())
             ok, output, compiled_path = _javac(cfg, stub, m.class_name, workdir)
             detail = output
             if ok:
