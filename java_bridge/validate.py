@@ -295,7 +295,11 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
 
 
 def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
-                  candidate_src: str, classpath: str) -> str:
+                  candidate_src: str, classpath: str,
+                  super_args: list[str] | None = None) -> str:
+    # super_args: when the real (stubbed) constructors must call a
+    # superclass ctor that has no no-arg overload, the args to use
+    # (None = emit plain '{}' bodies, the common case)
     # skip may be (name, descriptor): plain-name skip would replace EVERY
     # overload of the same name (e.g. all <init>s of a class with two
     # constructors), inserting the candidate multiple times.
@@ -385,10 +389,17 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
             body.append(f"  {m.modifiers} {ret} {name}({params_src});")
         elif ret == "void" or m.name == "<init>":
             ret_out = ret if m.name != "<init>" else ""
-            body.append(
-                "  "
-                + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ }}") if p)
-            )
+            if m.name == "<init>" and super_args is not None:
+                call = "super(" + ", ".join(super_args) + ");"
+                body.append(
+                    "  "
+                    + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ {call} }}") if p)
+                )
+            else:
+                body.append(
+                    "  "
+                    + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ }}") if p)
+                )
         else:
             body.append(
                 f"  {m.modifiers} {ret} {name}({params_src}) {{ throw new UnsupportedOperationException(); }}"
@@ -406,6 +417,77 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
         lines.append("")
     lines += body
     return "\n".join(lines) + "\n"
+
+
+_PRIMITIVE_DEFAULTS = {
+    "I": "0", "S": "0", "B": "0", "C": "'\\0'", "J": "0L",
+    "F": "0.0f", "D": "0.0d", "Z": "false",
+}
+
+
+def _default_for_source_type(t: str) -> str:
+    base = t.replace(" ", "").split("<")[0]
+    if base.endswith("[]"):
+        return "new " + _default_for_source_type(base[:-2]) + "[]"
+    if base == "int" or base == "short" or base == "byte":
+        return "0"
+    if base == "char":
+        return "'\\0'"
+    if base == "long":
+        return "0L"
+    if base == "float":
+        return "0.0f"
+    if base == "double":
+        return "0.0d"
+    if base == "boolean":
+        return "false"
+    return "null"
+
+
+def _parent_ctor_defaults(extends: str, classpath: str) -> list[str] | None:
+    """Default-arg list for the superclass's constructor (super(...) call).
+
+    Returns None when the parent has a no-arg ctor (no call needed).
+    Uses the parent's first public constructor, javap'd from the classpath.
+    """
+    if not extends:
+        return []
+    extends = extends.split("<")[0].strip()  # drop generic type args
+    cmd = ["javap", "-p", "-cp", classpath, extends]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            return None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    import re as _re
+    ctors = []
+    for ln in proc.stdout.splitlines():
+        if " extends " in ln:
+            continue
+        if re.search(rf"\b{_re.escape(extends.rsplit('.', 1)[-1])}\s*\(", ln) and ";" not in ln.split("(")[0]:
+            pass
+        m = _re.search(r"\)\s*\{?\s*$", ln)
+        if f".{extends.rsplit('.', 1)[-1]}(" in ln or ln.strip().startswith((extends.rsplit('.', 1)[-1] + "(")):
+            ctors.append(ln.strip().rstrip(";"))
+    if not ctors:
+        return None
+    # no-arg parent ctor: nothing to call
+    for c in ctors:
+        if c.index("(") and c[c.index("(") + 1:c.index(")")] == "":
+            return []
+    pick = ctors[0]
+    params_src = pick[pick.index("(") + 1:pick.rindex(")")]
+    if not params_src.strip():
+        return []
+    from .jvm import split_params
+    out = []
+    for p in split_params(params_src):
+        p = p.strip()
+        if not p:
+            continue
+        out.append(_default_for_source_type(re.sub(r"\s*[\w$]+$", "", p)))
+    return out
 
 
 def _javac(cfg: BridgeConfig, source: str, class_name: str, workdir: Path) -> tuple[bool, str, Path | None]:
@@ -487,6 +569,19 @@ def validate(cfg: BridgeConfig, idx: Index, candidate_file: Path,
                                 candidate_src, cfg.classpath_arg())
             ok, output, compiled_path = _javac(cfg, stub, m.class_name, workdir)
             detail = output
+            if not ok and ("cannot be applied" in output
+                           or "cannot find symbol" in output
+                           or "no suitable constructor" in output):
+                # stubbed ctors may need to call a superclass ctor that
+                # has no no-arg overload
+                defaults = _parent_ctor_defaults(
+                    idx.classes[m.class_name].extends, cfg.classpath_arg())
+                if defaults is not None:
+                    stub = _stub_source(idx, m.class_name, (m.name, m.descriptor),
+                                        candidate_src, cfg.classpath_arg(),
+                                        super_args=defaults)
+                    ok, output, compiled_path = _javac(cfg, stub, m.class_name, workdir)
+                    detail = output
             if ok:
                 print("note: compiled via stub-class fallback "
                       f"(CFR path failed: {primary_err[:200]})")
