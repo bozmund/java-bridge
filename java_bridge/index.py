@@ -339,6 +339,10 @@ def _deserialize(data: dict) -> Index:
                 address=m["address"],
             )
         )
+    # re-link per-class method lists (the cache stores the flat list only)
+    for m in methods:
+        if m.class_name in classes:
+            classes[m.class_name].methods.append(m)
     return Index(
         target=data["target"],
         fingerprint=data["fingerprint"],

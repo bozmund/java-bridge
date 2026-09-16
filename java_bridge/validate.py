@@ -15,6 +15,7 @@ output.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import tempfile
@@ -132,15 +133,24 @@ def _infer_target(idx: Index, candidate_file: Path, candidate_src: str,
     stem = candidate_file.stem
     # reagent names isolated candidates {safe_class}_{safe_func}(.cpp/.java);
     # the class part of the stem identifies the target class exactly.
-    matches = []
+    target_cls = None
     for m in idx.methods:
-        if m.name != cand_name:
-            continue
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", m.class_name)
-        if stem == f"{safe}_{cand_name}":
-            matches.append(m)
-    if not matches:
-        matches = [m for m in idx.methods if m.name == cand_name]
+        if stem == f"{safe}_{cand_name}" or stem.startswith(f"{safe}_"):
+            target_cls = m.class_name
+            break
+    simple = target_cls.rsplit(".", 1)[-1] if target_cls else None
+    inner = simple.rsplit("$", 1)[-1] if simple else None
+    # Java constructor syntax declares the class name; the index calls it
+    # <init>.
+    lookups = [cand_name]
+    if simple and cand_name in (simple, inner):
+        lookups.append("<init>")
+    if target_cls:
+        matches = [m for m in idx.methods
+                   if m.name in lookups and m.class_name == target_cls]
+    else:
+        matches = [m for m in idx.methods if m.name in lookups]
     if not matches:
         raise ValueError(f"no method named {cand_name!r} in the target")
     if len(matches) > 1:
@@ -156,13 +166,91 @@ def _infer_target(idx: Index, candidate_file: Path, candidate_src: str,
             if got == want:
                 narrowed.append(m)
         if len(narrowed) == 1:
-            return narrowed[0], cand_name
+            return narrowed[0], narrowed[0].name
         descs = ", ".join(sorted(m.class_name + m.descriptor for m in matches))
         raise ValueError(f"ambiguous candidate target ({descs}); pass --method")
-    return matches[0], cand_name
+    return matches[0], matches[0].name
 
 
-def _stub_source(idx: Index, cls_name: str, skip_method: str, candidate_src: str) -> str:
+_SIMPLE_TYPE_RE = re.compile(r"\b([A-Z][A-Za-z0-9_$]*)\b")
+_FQN_RE = re.compile(r"\b([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)+)\b")
+_CP_SIMPLE_CACHE: dict[tuple, dict[str, set[str]]] = {}
+
+
+def _classpath_simple_names(classpath: str) -> dict[str, set[str]]:
+    """Map simple class name -> {FQN, ...} over the whole classpath."""
+    key = (classpath,)
+    if key in _CP_SIMPLE_CACHE:
+        return _CP_SIMPLE_CACHE[key]
+    out: dict[str, set[str]] = {}
+
+    def add(fqn: str) -> None:
+        simple = fqn.rsplit(".", 1)[-1]
+        if simple and not simple.startswith("_"):
+            out.setdefault(simple, set()).add(fqn)
+
+    for entry in filter(None, classpath.split(os.pathsep)):
+        if entry.endswith(".jar"):
+            try:
+                import zipfile
+
+                with zipfile.ZipFile(entry) as zf:
+                    for n in zf.namelist():
+                        if n.endswith(".class") and "/" not in n[:1]:
+                            add(n[:-6].replace("/", "."))
+            except OSError:
+                continue
+        elif os.path.isdir(entry):
+            for dirpath, _dirs, files in os.walk(entry):
+                for fn in files:
+                    if fn.endswith(".class"):
+                        rel = os.path.relpath(os.path.join(dirpath, fn), entry)
+                        add(rel[:-6].replace(os.sep, "."))
+    _CP_SIMPLE_CACHE[key] = out
+    return out
+
+
+def _stub_imports(idx: Index, cls_name: str, source_text: str,
+                  classpath: str) -> list[str]:
+    """import lines for the simple names the candidate references.
+
+    Resolution priority: the target class's own javap text (its real
+    dependencies), then the mod index, then the full classpath. Names in
+    java.lang or the stub's own package never need imports.
+    """
+    own_fqns: dict[str, set[str]] = {}
+    cls = idx.classes.get(cls_name)
+    if cls is not None:
+        for fqn in _FQN_RE.findall(cls.raw or ""):
+            own_fqns.setdefault(fqn.rsplit(".", 1)[-1], set()).add(fqn)
+    mod_fqns: dict[str, set[str]] = {}
+    for c in idx.classes:
+        simple = c.rsplit(".", 1)[-1]
+        mod_fqns.setdefault(simple, set()).add(c)
+    cp = _classpath_simple_names(classpath)
+    own_pkg = cls_name.rsplit(".", 1)[0] if "." in cls_name else ""
+    def usable(c: str) -> bool:
+        return (not c.startswith("java.lang.") and c != cls_name
+                and c.rsplit(".", 1)[0] != own_pkg and "$" not in c)
+
+    imports: dict[str, str] = {}
+    for name in _SIMPLE_TYPE_RE.findall(source_text):
+        # Priority: the class's own dependencies (its javap text) — the
+        # classpath alone is ambiguous (e.g. six `Path` classes).
+        own_c = {c for c in own_fqns.get(name, set()) if usable(c)}
+        if own_c:
+            if len(own_c) == 1:
+                imports[name] = next(iter(own_c))
+            continue
+        cands = {c for c in (mod_fqns.get(name, set()) | cp.get(name, set()))
+                 if usable(c)}
+        if len(cands) == 1:
+            imports[name] = next(iter(cands))
+    return sorted(f"import {fqn};" for fqn in imports.values())
+
+
+def _stub_source(idx: Index, cls_name: str, skip_method: str,
+                  candidate_src: str, classpath: str) -> str:
     cls = idx.classes[cls_name]
     if cls.is_enum:
         raise RuntimeError("stub-class fallback is not supported for enums")
@@ -177,6 +265,12 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str, candidate_src: str
     pkg = cls_name.rsplit(".", 1)[0] if "." in cls_name else ""
     if pkg:
         lines.append(f"package {pkg};")
+        lines.append("")
+    # The candidate references types by simple name (like the original
+    # source); the stub has no original import block, so resolve the simple
+    # names against the class's real dependencies and the classpath.
+    lines += _stub_imports(idx, cls_name, candidate_src, classpath)
+    if lines and lines[-1] != "":
         lines.append("")
     kind = cls.kind if cls.kind in ("class", "interface", "record") else "class"
     decl = f"{kind} {cls_name.rsplit('.', 1)[-1]}"
@@ -315,7 +409,7 @@ def validate(cfg: BridgeConfig, idx: Index, candidate_file: Path,
         primary_err = str(exc)
         # Fallback: stub class from javap metadata.
         try:
-            stub = _stub_source(idx, m.class_name, m.name, candidate_src)
+            stub = _stub_source(idx, m.class_name, m.name, candidate_src, cfg.classpath_arg())
             ok, output, compiled_path = _javac(cfg, stub, m.class_name, workdir)
             detail = output
             if ok:
