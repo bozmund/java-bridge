@@ -243,8 +243,10 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
         mod_fqns.setdefault(simple, set()).add(c)
     cp = _classpath_simple_names(classpath)
     own_pkg = cls_name.rsplit(".", 1)[0] if "." in cls_name else ""
+    own_simple = cls_name.rsplit(".", 1)[-1]
     def usable(c: str) -> bool:
         return (not c.startswith("java.lang.") and c != cls_name
+                and c.rsplit(".", 1)[-1] != own_simple
                 and c.rsplit(".", 1)[0] != own_pkg and "$" not in c)
 
     def pick(pool: set[str]) -> str | None:
@@ -287,6 +289,12 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
     else:
         skip_name, skip_desc = skip_method, None
     cls = idx.classes[cls_name]
+    # A record canonical constructor may not contain an explicit
+    # super(...) invocation (the Record.<init> call is implicit in
+    # source, present in bytecode). The decompiler shows it; strip it.
+    if cls.extends in ("java.lang.Record", "Record") and skip_name == "<init>":
+        candidate_src = re.sub(
+            r"\s*super\([^)]*\)\s*;", "", candidate_src, count=1)
     if cls.is_enum:
         raise RuntimeError("stub-class fallback is not supported for enums")
     header = ""
@@ -298,15 +306,26 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
     impl = re.search(r"\bimplements\b(.+)$", header)
     lines = []
     pkg = cls_name.rsplit(".", 1)[0] if "." in cls_name else ""
-    kind = cls.kind if cls.kind in ("class", "interface", "record") else "class"
+    # javap prints records as plain classes extending java.lang.Record
+    is_record = cls.extends in ("java.lang.Record", "Record")
+    kind = "record" if is_record else (
+        cls.kind if cls.kind in ("class", "interface", "record") else "class")
     decl = f"{kind} {cls_name.rsplit('.', 1)[-1]}"
-    if cls.extends and cls.kind != "interface":
+    if is_record:
+        # record header takes the components (the record's fields, in
+        # declaration order); components are final fields and cannot be
+        # re-declared in the body.
+        comps = ", ".join(f"{f.type.replace('$', '.')} {f.name}" for f in cls.fields)
+        decl += f"({comps})"
+    elif cls.extends and cls.kind != "interface":
         decl += f" extends {cls.extends}"
     if impl:
         decl += f" implements {impl.group(1).strip()}"
     body: list[str] = []
     body.append(decl + " {")
     for f in cls.fields:
+        if is_record:
+            continue  # components already in the header
         if cls.is_enum and f.type == cls_name:
             continue  # enum constants need bodies
         # generics in the signature attribute keep descriptor-style '$' for
