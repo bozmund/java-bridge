@@ -210,8 +210,14 @@ def _classpath_simple_names(classpath: str) -> dict[str, set[str]]:
     return out
 
 
+def _simple_of(fqn: str) -> str:
+    """Import-relevant simple name: Outer$Inner counts as Inner."""
+    return fqn.rsplit(".", 1)[-1].rsplit("$", 1)[-1]
+
+
 def _stub_imports(idx: Index, cls_name: str, source_text: str,
-                  classpath: str) -> list[str]:
+                  classpath: str,
+                  extra_class: str | None = None) -> list[str]:
     """import lines for the simple names the stub references.
 
     Resolution priority: the target class's own bytecode references
@@ -224,8 +230,12 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
     """
     own_fqns: dict[str, set[str]] = {}
     cls = idx.classes.get(cls_name)
+    raw = (cls.raw if cls is not None else "") or ""
+    if extra_class is not None:
+        ec = idx.classes.get(extra_class)
+        if ec is not None:
+            raw += "\n" + (ec.raw or "")
     if cls is not None:
-        raw = cls.raw or ""
         # javap comments use internal (slash) names:
         #   // Method java/util/Arrays.fill:([II)V
         #   // Field dev/streamsreflowing/X.y:I
@@ -240,12 +250,12 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
             # and need no import either, so skip all bare tokens.
             if "/" not in tok and "." not in tok:
                 continue
-            own_fqns.setdefault(fqn.rsplit(".", 1)[-1], set()).add(fqn)
+            own_fqns.setdefault(_simple_of(fqn), set()).add(fqn)
         # dot-form scan on the de-commented raw: inside '//' comments the
         # 'Class.FIELD' suffix of a slash path would match as a fake FQN
         # (BlockTags.LEAVES) and poison the pool.
         for fqn in _FQN_RE.findall(re.sub(r"//.*$", "", raw, flags=re.M)):
-            own_fqns.setdefault(fqn.rsplit(".", 1)[-1], set()).add(fqn)
+            own_fqns.setdefault(_simple_of(fqn), set()).add(fqn)
     mod_fqns: dict[str, set[str]] = {}
     for c in idx.classes:
         simple = c.rsplit(".", 1)[-1]
@@ -253,24 +263,51 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
     cp = _classpath_simple_names(classpath)
     own_pkg = cls_name.rsplit(".", 1)[0] if "." in cls_name else ""
     own_simple = cls_name.rsplit(".", 1)[-1]
+    # a class in the stub's own package cannot be imported (Java has no
+    # same-package imports); an external jar class with the same simple
+    # name (javax.inject.Provider vs the stub's nested Provider) would
+    # shadow the stub member. Such names must simply be skipped.
+    # simple names the stub itself defines (its nested classes/fields in
+    # the same package): an external class with the same simple name
+    # (javax.inject.Provider vs the stub's nested Provider) would shadow
+    # the stub member and cannot be imported around — skip it.
+    stub_simples = {own_simple}
+    for fqn_set in mod_fqns.values():
+        for c in fqn_set:
+            if "." in c and c.rsplit(".", 1)[0] == own_pkg:
+                stub_simples.add(_simple_of(c))
     def usable(c: str) -> bool:
         return (not c.startswith("java.lang.") and c != cls_name
-                and c.rsplit(".", 1)[-1] != own_simple
-                and c.rsplit(".", 1)[0] != own_pkg and "$" not in c)
+                and _simple_of(c) != own_simple
+                and _simple_of(c) not in stub_simples
+                and "$" not in c)
 
-    def pick(pool: set[str]) -> str | None:
+    def pick(pool: set[str], verified: bool) -> str | None:
         jdk = {c for c in pool if c.startswith(("java.", "javax."))}
         if len(jdk) == 1:
             return next(iter(jdk))
         if len(pool) == 1:
             return next(iter(pool))
-        return None
+        # ambiguous: only trust the bytecode-verified pool; the
+        # classpath pool alone may pick a wrong look-alike (bouncycastle
+        # Layer for Minecraft's Layer)
+        return next(iter(pool)) if verified else None
 
+    # @Override lines name the member, not a type
+    source_text = re.sub(r"@\w+[^\n]*", "", source_text)
     imports: dict[str, str] = {}
     for name in _SIMPLE_TYPE_RE.findall(source_text):
         # Single uppercase letters and CONSTANT_STYLE names are this
         # codebase's variable/constant fields, not type names.
         if len(name) == 1 or ("_" in name and name == name.upper()):
+            continue
+        # qualified only (Outer.Inner occurrences): the simple name is a
+        # member of an imported outer type, not a type itself
+        if name in imports:
+            continue
+        total = len(re.findall(r"(?<![\w$])" + re.escape(name) + r"\b", source_text))
+        qualified = len(re.findall(r"\." + re.escape(name) + r"\b", source_text))
+        if total and total == qualified:
             continue
         # Priority: the class's own dependencies (its bytecode) — the
         # classpath alone is ambiguous (e.g. six `Path` classes).
@@ -282,13 +319,13 @@ def _stub_imports(idx: Index, cls_name: str, source_text: str,
                 and len(own_c) != 1):
             continue
         if own_c:
-            chosen = pick(own_c)
+            chosen = pick(own_c, verified=True)
             if chosen:
                 imports[name] = chosen
-            continue
+                continue
         cands = {c for c in (mod_fqns.get(name, set()) | cp.get(name, set()))
                  if usable(c)}
-        chosen = pick(cands)
+        chosen = pick(cands, verified=False)
         if chosen:
             imports[name] = chosen
     return sorted(f"import {fqn};" for fqn in imports.values())
@@ -324,12 +361,42 @@ def _bridge_method_descriptors(cls: object) -> set[str]:
                                  if m.name == name
                                  and tuple(p.replace("$", ".") for p in parse_descriptor(m.descriptor)[0]) == a))
                     break
+    # bytecode-based: a synthetic bridge's whole body is
+    # (loads + optional checkcasts) + one self-invoke + return.
+    load_ops = re.compile(
+        r"^(aload|aload_[0-9]|iload|iload_[0-9]|lload|lload_[0-9]|fload|"
+        r"fload_[0-9]|dload|dload_[0-9]|getstatic)$")
+    for m in cls.methods:
+        if m.name in ("<init>", "<clinit>") or not m.lines:
+            continue
+        lines = m.lines
+        if len(lines) > 30:
+            continue
+        if not re.match(r"^(i|l|f|d|a)?return$", lines[-1].opcode):
+            continue
+        invokes = [l for l in lines if l.opcode.startswith("invoke")]
+        if len(invokes) != 1:
+            continue
+        inv = invokes[0]
+        if not re.search(rf"\b{re.escape(m.name)}[:(]", inv.comment or ""):
+            continue
+        ok = True
+        for l in lines:
+            if l is inv:
+                continue
+            if l.opcode == "checkcast":
+                continue
+            if not load_ops.match(l.opcode):
+                ok = False
+                break
+        if ok:
+            out.add(m.descriptor)
     return out
 
 
 def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
                   candidate_src: str, classpath: str,
-                  super_args: list[str] | None = None,
+                  super_args: list[str] | dict[str, list[str]] | None = None,
                   nested_target: str | None = None) -> str:
     """Full stub compilation unit for a candidate.
 
@@ -339,7 +406,8 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
     """
     body = _stub_body_lines(idx, cls_name, skip_method, candidate_src,
                             classpath, super_args, nested_target)
-    imports = _stub_imports(idx, cls_name, "\n".join(body), classpath)
+    imports = _stub_imports(idx, cls_name, "\n".join(body), classpath,
+                            extra_class=nested_target)
     pkg = cls_name.rsplit(".", 1)[0] if "." in cls_name else ""
     lines: list[str] = []
     if pkg:
@@ -355,11 +423,16 @@ def _stub_source(idx: Index, cls_name: str, skip_method: str | tuple[str, str],
 def _stub_body_lines(idx: Index, cls_name: str,
                      skip_method: str | tuple[str, str],
                      candidate_src: str, classpath: str,
-                     super_args: list[str] | None = None,
+                     super_args: list[str] | dict[str, list[str]] | None = None,
                      nested_target: str | None = None) -> list[str]:
     # super_args: when the real (stubbed) constructors must call a
     # superclass ctor that has no no-arg overload, the args to use
-    # (None = emit plain '{}' bodies, the common case)
+    # (None = emit plain '{}' bodies, the common case); a dict maps
+    # class_name -> args for per-class control (nested targets)
+    if isinstance(super_args, dict):
+        my_super_args = super_args.get(cls_name)
+    else:
+        my_super_args = super_args
     # skip may be (name, descriptor): plain-name skip would replace EVERY
     # overload of the same name (e.g. all <init>s of a class with two
     # constructors), inserting the candidate multiple times.
@@ -422,15 +495,24 @@ def _stub_body_lines(idx: Index, cls_name: str,
     for other_name in sorted(idx.classes):
         if other_name.startswith(cls_name + "$"):
             other = idx.classes[other_name]
-            simple = other_name.rsplit("$", 1)[-1]
-            if simple.isdigit() or re.match(r"^\d", simple):
+            other_simple = other_name.rsplit("$", 1)[-1]
+            if other_name == nested_target:
+                # inline the target's stub as a real nested class so
+                # private access outer<->inner checks as in the source
+                # tree; anonymous targets get an __AnonN stand-in name.
+                inner_lines = _stub_body_lines(
+                    idx, other_name, skip_method, candidate_src, classpath,
+                    super_args, nested_target=None)
+                body.extend("  " + ln for ln in inner_lines)
+                continue
+            if other_simple.isdigit() or re.match(r"^\d", other_simple):
                 continue  # anonymous class; not a usable type name
             if other.kind == "interface":
-                body.append(f"  static interface {simple} {{}}")
+                body.append(f"  static interface {other_simple} {{}}")
             elif other.is_enum:
-                body.append(f"  static enum {simple} {{ PLACEHOLDER }}")
+                body.append(f"  static enum {other_simple} {{ PLACEHOLDER }}")
             else:
-                body.append(f"  static class {simple} {{}}")
+                body.append(f"  static class {other_simple} {{}}")
     bridges = _bridge_method_descriptors(cls)
     for m in cls.methods:
         if m.name == "<clinit>":
@@ -463,8 +545,8 @@ def _stub_body_lines(idx: Index, cls_name: str,
             body.append(f"  {m.modifiers} {ret} {name}({params_src});")
         elif ret == "void" or m.name == "<init>":
             ret_out = ret if m.name != "<init>" else ""
-            if m.name == "<init>" and super_args is not None:
-                call = "super(" + ", ".join(super_args) + ");"
+            if m.name == "<init>" and my_super_args is not None:
+                call = "super(" + ", ".join(my_super_args) + ");"
                 body.append(
                     "  "
                     + " ".join(p for p in (m.modifiers, ret_out, f"{name}({params_src}) {{ {call} }}") if p)
@@ -539,7 +621,15 @@ def _parent_ctor_defaults(extends: str, classpath: str) -> list[str] | None:
     for c in ctors:
         if c.index("(") and c[c.index("(") + 1:c.index(")")] == "":
             return []
-    pick = ctors[0]
+
+    def _ref_count(c: str) -> int:
+        p = c[c.index("(") + 1:c.rindex(")")]
+        return sum(1 for x in p.split(",")
+                   if x.strip() and not any(x.strip().startswith(s)
+                                            for s in ("int", "long", "float",
+                                                      "double", "boolean",
+                                                      "char", "short", "byte")))
+    pick = min(ctors, key=_ref_count)
     params_src = pick[pick.index("(") + 1:pick.rindex(")")]
     if not params_src.strip():
         return []
@@ -549,7 +639,8 @@ def _parent_ctor_defaults(extends: str, classpath: str) -> list[str] | None:
         p = p.strip()
         if not p:
             continue
-        out.append(_default_for_source_type(re.sub(r"\s*[\w$]+$", "", p)))
+        # javap -p prints bare types (no parameter names)
+        out.append(_default_for_source_type(p))
     return out
 
 
@@ -631,17 +722,28 @@ def validate(cfg: BridgeConfig, idx: Index, candidate_file: Path,
         primary_err = str(exc)
         # Fallback: stub class from javap metadata.
         try:
-            if "$" in m.class_name:
-                outer_name = m.class_name.rsplit("$", 1)[0]
-                stub = _stub_source(idx, outer_name, (m.name, m.descriptor),
+            nested = "$" in m.class_name
+            outer_name = m.class_name.rsplit("$", 1)[0] if nested else None
+
+            def build_stub(super_args=None):
+                if nested:
+                    if super_args is not None:
+                        super_args = {outer_name: super_args}
+                    return _stub_source(idx, outer_name, (m.name, m.descriptor),
+                                        candidate_src, cfg.classpath_arg(),
+                                        super_args=super_args,
+                                        nested_target=m.class_name)
+                return _stub_source(idx, m.class_name, (m.name, m.descriptor),
                                     candidate_src, cfg.classpath_arg(),
-                                    nested_target=m.class_name)
-                ok, output, compiled_path = _javac(
-                    cfg, stub, m.class_name, workdir, outer_class=outer_name)
-            else:
-                stub = _stub_source(idx, m.class_name, (m.name, m.descriptor),
-                                    candidate_src, cfg.classpath_arg())
-                ok, output, compiled_path = _javac(cfg, stub, m.class_name, workdir)
+                                    super_args=super_args)
+
+            def compile(stub):
+                if nested:
+                    return _javac(cfg, stub, m.class_name, workdir,
+                                  outer_class=outer_name)
+                return _javac(cfg, stub, m.class_name, workdir)
+
+            ok, output, compiled_path = compile(build_stub())
             detail = output
             if not ok and ("cannot be applied" in output
                            or "cannot find symbol" in output
@@ -649,12 +751,11 @@ def validate(cfg: BridgeConfig, idx: Index, candidate_file: Path,
                 # stubbed ctors may need to call a superclass ctor that
                 # has no no-arg overload
                 defaults = _parent_ctor_defaults(
-                    idx.classes[m.class_name].extends, cfg.classpath_arg())
+                    idx.classes[outer_name if nested else m.class_name].extends,
+                    cfg.classpath_arg())
                 if defaults is not None:
-                    stub = _stub_source(idx, m.class_name, (m.name, m.descriptor),
-                                        candidate_src, cfg.classpath_arg(),
-                                        super_args=defaults)
-                    ok, output, compiled_path = _javac(cfg, stub, m.class_name, workdir)
+                    ok, output, compiled_path = compile(
+                        build_stub(super_args=defaults))
                     detail = output
             if ok:
                 print("note: compiled via stub-class fallback "
