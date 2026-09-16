@@ -349,7 +349,13 @@ def _deserialize(data: dict) -> Index:
 
 
 def load(cfg: BridgeConfig, force: bool = False) -> Index:
-    """Load the index from cache or rebuild it."""
+    """Load the index from cache or rebuild it.
+
+    The cache file is written atomically (tmp + rename) so concurrent
+    readers always see a complete file — a torn read mid-write used to
+    cause JSONDecodeError -> rebuild -> write cascades when several
+    java-bridge processes ran in parallel.
+    """
     fp = _fingerprint(cfg.target)
     cf = _cache_file(cfg, fp)
     if not force and cf.exists():
@@ -360,5 +366,7 @@ def load(cfg: BridgeConfig, force: bool = False) -> Index:
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
     idx = _build(cfg)
-    cf.write_text(json.dumps(_serialize(idx)), encoding="utf-8")
+    tmp = cf.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(_serialize(idx)), encoding="utf-8")
+    tmp.replace(cf)
     return idx
