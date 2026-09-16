@@ -130,13 +130,14 @@ def _infer_target(idx: Index, candidate_file: Path, candidate_src: str,
     if cand_name is None:
         raise ValueError("cannot find a method declaration in the candidate file")
     stem = candidate_file.stem
-    # reagent names isolated candidates {safe_class}_{safe_func}(.cpp/.java)
+    # reagent names isolated candidates {safe_class}_{safe_func}(.cpp/.java);
+    # the class part of the stem identifies the target class exactly.
     matches = []
     for m in idx.methods:
         if m.name != cand_name:
             continue
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", m.class_name)
-        if stem == f"{safe}_{cand_name}" or stem.endswith(f"_{cand_name}"):
+        if stem == f"{safe}_{cand_name}":
             matches.append(m)
     if not matches:
         matches = [m for m in idx.methods if m.name == cand_name]
@@ -152,7 +153,7 @@ def _infer_target(idx: Index, candidate_file: Path, candidate_src: str,
         narrowed = []
         for m in matches:
             want = [java_type_key(p) for p in parse_descriptor(m.descriptor)[0]]
-            if got and got == want:
+            if got == want:
                 narrowed.append(m)
         if len(narrowed) == 1:
             return narrowed[0], cand_name
