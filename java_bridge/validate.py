@@ -114,7 +114,7 @@ def _signature_params(candidate_src: str) -> list[str]:
     m = CANDIDATE_METHOD_RE.match(candidate_src.lstrip("\n"))
     if not m:
         return []
-    return [p.strip() for p in m.group(5).split(",") if p.strip()]
+    return split_params(m.group(5))
 
 
 def _infer_target(idx: Index, candidate_file: Path, candidate_src: str,
@@ -143,12 +143,12 @@ def _infer_target(idx: Index, candidate_file: Path, candidate_src: str,
     if not matches:
         raise ValueError(f"no method named {cand_name!r} in the target")
     if len(matches) > 1:
-        from .jvm import java_type_key
+        from .jvm import java_type_key, split_params
 
         got = []
         if sig:
             got = [java_type_key(_param_type_from_source(p)) for p in
-                   (p.strip() for p in sig.group(5).split(",") if p.strip())]
+                   split_params(sig.group(5))]
         narrowed = []
         for m in matches:
             want = [java_type_key(p) for p in parse_descriptor(m.descriptor)[0]]

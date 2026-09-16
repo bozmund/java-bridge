@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .config import BridgeConfig
 from .index import Index
-from .jvm import java_type_key, parse_descriptor
+from .jvm import java_type_key, split_params, parse_descriptor
 
 CFR_TIMEOUT_S = 300
 
@@ -146,7 +146,7 @@ def method_at(class_source: str, class_name: str, name: str, descriptor: str) ->
     )
     best: tuple[int, int, str] | None = None
     for m in header_re.finditer(class_source):
-        params_src = [p for p in m.group("params").split(",") if p.strip()]
+        params_src = split_params(m.group("params"))
         if expected_params is not None and len(params_src) != len(expected_params):
             continue
         if expected_params is not None:

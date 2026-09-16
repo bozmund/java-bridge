@@ -74,3 +74,22 @@ def java_type_key(type_name: str) -> str:
     if "<" in t:  # drop generic parameters
         t = t[: t.index("<")]
     return re.split(r"[.$]", t)[-1]
+
+
+def split_params(params_str: str) -> list[str]:
+    """Split a Java parameter list on top-level commas only.
+
+    Generic arguments may contain commas (``Map<Long, long[]>``); naive
+    ``split(",")`` yields phantom parameters and breaks descriptor matching.
+    """
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(params_str):
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(params_str[start:i])
+            start = i + 1
+    parts.append(params_str[start:])
+    return [p.strip() for p in parts if p.strip()]
