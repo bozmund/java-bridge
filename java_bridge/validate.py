@@ -454,6 +454,11 @@ def _stub_body_lines(idx: Index, cls_name: str,
         ret = ret.replace("$", ".")
         params_src = ", ".join(f"{t} p{i}" for i, t in enumerate(params))
         name = simple if m.name == "<init>" else m.name
+        # ctors never take visibility modifiers in source
+        mods = " ".join(mm for mm in m.modifiers.split()
+                        if mm not in ("public", "protected", "private"))
+        if m.name == "<init>":
+            m.modifiers = mods
         if "abstract" in m.modifiers or (cls.is_interface and "default" not in m.modifiers):
             body.append(f"  {m.modifiers} {ret} {name}({params_src});")
         elif ret == "void" or m.name == "<init>":
