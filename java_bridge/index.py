@@ -272,7 +272,8 @@ def _serialize(idx: Index) -> dict:
                 "extends": c.extends,
                 "fields": [
                     {"name": f.name, "type": f.type, "modifiers": f.modifiers,
-                     "descriptor": f.descriptor, "const_value": f.const_value}
+                     "descriptor": f.descriptor, "const_value": f.const_value,
+                     "class_name": f.class_name}
                     for f in c.fields
                 ],
                 "raw": c.raw,
@@ -311,6 +312,7 @@ def _deserialize(data: dict) -> Index:
             extends=c.get("extends", ""),
             fields=[
                 FieldInfo(
+                    class_name=f.get("class_name", name),
                     name=f["name"], type=f["type"], modifiers=f.get("modifiers", ""),
                     descriptor=f.get("descriptor", ""), const_value=f.get("const_value", ""),
                 )
