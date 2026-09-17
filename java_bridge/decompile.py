@@ -163,16 +163,55 @@ def method_at(class_source: str, class_name: str, name: str, descriptor: str) ->
         # forward to the matching brace.
         start = m.start()
         if last == "{":
+            # string/char/comment-aware brace walk: a naive count stops at
+            # a '}' inside a string literal (e.g. a "{}" log format) and
+            # yields a bogus method span
             depth = 0
             i = m.end() - 1
-            while i < len(class_source):
+            in_str = in_chr = in_line = in_block = False
+            n = len(class_source)
+            while i < n:
                 ch = class_source[i]
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return (start, i + 1, class_source[start : i + 1])
+                nxt = class_source[i + 1] if i + 1 < n else ""
+                if in_line:
+                    if ch == "\n":
+                        in_line = False
+                elif in_block:
+                    if ch == "*" and nxt == "/":
+                        in_block = False
+                        i += 1
+                elif in_str:
+                    if ch == "\\":
+                        i += 1
+                    elif ch == '"':
+                        in_str = False
+                    elif ch == "\n":
+                        in_str = False
+                elif in_chr:
+                    if ch == "\\":
+                        i += 1
+                    elif ch == "'":
+                        in_chr = False
+                    elif ch == "\n":
+                        in_chr = False
+                else:
+                    if ch == "/" and nxt == "/":
+                        in_line = True
+                        i += 1
+                    elif ch == "/" and nxt == "*":
+                        in_block = True
+                        i += 1
+                    elif ch == '"':
+                        in_str = True
+                    elif ch == "'":
+                        in_chr = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return (start, i + 1,
+                                    class_source[start : i + 1])
                 i += 1
             return None
         end = m.end()
