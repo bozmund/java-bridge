@@ -58,11 +58,15 @@ def _match_brace(text: str, open_idx: int) -> int | None:
                 i += 1
             elif ch == '"':
                 in_str = False
+            elif ch == "\n":
+                in_str = False  # resync: a string never spans a newline
         elif in_chr:
             if ch == "\\":
                 i += 1
             elif ch == "'":
                 in_chr = False
+            elif ch == "\n":
+                in_chr = False  # resync: same, for char literals
         else:
             if ch == "/" and nxt == "/":
                 in_line = True
