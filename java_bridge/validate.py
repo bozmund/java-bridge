@@ -496,7 +496,7 @@ def _stub_body_lines(idx: Index, cls_name: str,
             comps = ", ".join(f"java.lang.Object {c}" for c in comp_names)
         decl += f"({comps})"
     elif cls.extends and cls.kind != "interface":
-        decl += f" extends {cls.extends}"
+        decl += " extends " + cls.extends.replace("$", ".")
     if impl:
         decl += " implements " + impl.group(1).strip().replace("$", ".")
     body: list[str] = []
