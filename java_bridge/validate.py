@@ -468,6 +468,7 @@ def _stub_body_lines(idx: Index, cls_name: str,
         simple = inner if not inner.isdigit() else f"__Anon{inner}"
     decl = f"{kind} {simple}"
     comp_names: list[str] = []
+    comp_types: list[str] = []
     if is_record:
         # Components are the canonical constructor's parameters, named
         # after the implicit accessor methods (accessors are the only
@@ -621,6 +622,15 @@ def _stub_body_lines(idx: Index, cls_name: str,
                 continue
             if m.name == "<init>":
                 ctor_parts = []
+                if is_record and len(params) != len(comp_names) and comp_names:
+                    # non-canonical record ctor must chain to the
+                    # canonical one: own params + defaults for the rest
+                    chained = [f"p{i}" for i in range(len(params))]
+                    while len(chained) < len(comp_names):
+                        chained.append(
+                            _default_for_source_type(comp_types[len(chained)])
+                            if len(comp_types) > len(chained) else "null")
+                    ctor_parts.append("this(" + ", ".join(chained) + ");")
                 if my_super_args is not None:
                     ctor_parts.append("super(" + ", ".join(my_super_args) + ");")
                 if final_assigns:
