@@ -666,7 +666,15 @@ _PRIMITIVE_DEFAULTS = {
 def _default_for_source_type(t: str) -> str:
     base = t.replace(" ", "").split("<")[0]
     if base.endswith("[]"):
-        return "new " + _default_for_source_type(base[:-2]) + "[]"
+        # array default must be a real array creation; the element is the
+        # type NAME (not a default value), e.g. new PlateKey[0], not new null[]
+        inner = base
+        dims = 0
+        while inner.endswith("[]"):
+            inner = inner[:-2]
+            dims += 1
+        elem = inner.rsplit(".", 1)[-1]
+        return f"new {elem}" + "[0]" * dims
     if base == "int" or base == "short" or base == "byte":
         return "0"
     if base == "char":
