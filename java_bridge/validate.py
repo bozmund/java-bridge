@@ -537,7 +537,7 @@ def _stub_body_lines(idx: Index, cls_name: str,
                 continue  # anonymous class; not a usable type name
             # Full stub: candidates may call nested ctors/methods.
             inner_lines = _stub_body_lines(
-                idx, other_name, None, "", classpath, None,
+                idx, other_name, None, "", classpath, super_args,
                 nested_target=None)
             # A genuine inner class (non-static) ctor takes the enclosing
             # instance as first param; all others are static nested.
@@ -842,13 +842,23 @@ def validate(cfg: BridgeConfig, idx: Index, candidate_file: Path,
                            or "cannot find symbol" in output
                            or "no suitable constructor" in output):
                 # stubbed ctors may need to call a superclass ctor that
-                # has no no-arg overload
-                defaults = _parent_ctor_defaults(
-                    idx.classes[outer_name if nested else m.class_name].extends,
-                    cfg.classpath_arg())
-                if defaults is not None:
+                # has no no-arg overload. Try every class in the stub
+                # (the failing ctor may belong to a nested class, e.g.
+                # StreamAudio$Voice extending AbstractTickableSoundInstance).
+                base = outer_name if nested else m.class_name
+                super_args: dict[str, list[str]] = {}
+                for cname in sorted(idx.classes):
+                    if cname != base and not cname.startswith(base + "$"):
+                        continue
+                    c = idx.classes[cname]
+                    if c.extends:
+                        d = _parent_ctor_defaults(c.extends,
+                                                  cfg.classpath_arg())
+                        if d:
+                            super_args[cname] = d
+                if super_args:
                     ok, output, compiled_path = compile(
-                        build_stub(super_args=defaults))
+                        build_stub(super_args=super_args))
                     detail = output
             if ok:
                 print("note: compiled via stub-class fallback "
